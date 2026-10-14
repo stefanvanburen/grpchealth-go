@@ -15,7 +15,6 @@
 package grpchealth
 
 import (
-	"context"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -82,99 +81,4 @@ func TestClient_Check(t *testing.T) {
 	if code := connectErr.Code(); code != connect.CodeNotFound {
 		t.Fatalf("got code %v, expected CodeNotFound", code)
 	}
-}
-
-func TestClient_Watch(t *testing.T) {
-	const userFQN = "acme.user.v1.UserService"
-	t.Parallel()
-	checker := NewStaticChecker(userFQN)
-	mux := http.NewServeMux()
-	connectServer := connect.NewServer()
-	Register(connectServer, checker)
-	connecthttp.Mount(mux, connectServer)
-	server := httptest.NewUnstartedServer(mux)
-	server.EnableHTTP2 = true
-	server.StartTLS()
-	t.Cleanup(server.Close)
-
-	client := NewClient(connect.NewClient(connecthttp.NewTransport(
-		server.Client(),
-		server.URL,
-		connecthttp.WithGRPC(),
-	)))
-
-	ctx, cancel := context.WithCancel(t.Context())
-	defer cancel()
-	events := client.Watch(ctx, &CheckRequest{Service: userFQN})
-
-	recv := func(t *testing.T, expect Status) {
-		t.Helper()
-		event, ok := <-events
-		if !ok {
-			t.Fatal("channel closed unexpectedly")
-		}
-		if event.Err != nil {
-			t.Fatalf("unexpected error: %v", event.Err)
-		}
-		if event.Response.Status != expect {
-			t.Fatalf("got status %v, expected %v", event.Response.Status, expect)
-		}
-	}
-
-	// First status is delivered immediately.
-	recv(t, StatusServing)
-
-	// Status transitions propagate through the channel.
-	checker.SetStatus(userFQN, StatusNotServing)
-	recv(t, StatusNotServing)
-
-	checker.SetStatus(userFQN, StatusServing)
-	recv(t, StatusServing)
-
-	// Canceling the context closes the channel.
-	cancel()
-	for range events { // Drain until the channel closes.
-	}
-}
-
-func TestClient_Watch_unknownService(t *testing.T) {
-	t.Parallel()
-	checker := NewStaticChecker()
-	mux := http.NewServeMux()
-	connectServer := connect.NewServer()
-	Register(connectServer, checker)
-	connecthttp.Mount(mux, connectServer)
-	server := httptest.NewUnstartedServer(mux)
-	server.EnableHTTP2 = true
-	server.StartTLS()
-	t.Cleanup(server.Close)
-
-	client := NewClient(connect.NewClient(connecthttp.NewTransport(
-		server.Client(),
-		server.URL,
-		connecthttp.WithGRPC(),
-	)))
-
-	ctx, cancel := context.WithCancel(t.Context())
-	defer cancel()
-	events := client.Watch(ctx, &CheckRequest{Service: "unknown.Service"})
-	recv := func(t *testing.T, expect Status) {
-		t.Helper()
-		event, ok := <-events
-		if !ok {
-			t.Fatal("channel closed unexpectedly")
-		}
-		if event.Err != nil {
-			t.Fatalf("unexpected error: %v", event.Err)
-		}
-		if event.Response.Status != expect {
-			t.Fatalf("got status %v, expected %v", event.Response.Status, expect)
-		}
-	}
-
-	// An unknown service reports StatusServiceUnknown, then its status
-	// once it becomes known.
-	recv(t, StatusServiceUnknown)
-	checker.SetStatus("unknown.Service", StatusNotServing)
-	recv(t, StatusNotServing)
 }

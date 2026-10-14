@@ -23,9 +23,11 @@ import (
 	"strings"
 	"testing"
 	"testing/quick"
+	"testing/synctest"
 
 	"connectrpc.com/connect/v2"
 	"connectrpc.com/connect/v2/connecthttp"
+	"connectrpc.com/connect/v2/connectinprocess"
 	healthv1 "connectrpc.com/grpchealth/v2/internal/gen/go/connectext/grpc/health/v1"
 )
 
@@ -143,122 +145,76 @@ func TestHealth_Check(t *testing.T) {
 
 func TestHealth_Watch(t *testing.T) {
 	const (
-		userFQN = "acme.user.v1.UserService"
-		pingFQN = "acme.ping.v1.PingService"
+		userFQN    = "acme.user.v1.UserService"
+		pingFQN    = "acme.ping.v1.PingService"
+		unknownFQN = "acme.unknown.v1.UnknownService"
 	)
 	t.Parallel()
-	checker := NewStaticChecker(userFQN, pingFQN)
-	mux := http.NewServeMux()
-	connectServer := connect.NewServer()
-	Register(connectServer, checker)
-	connecthttp.Mount(mux, connectServer)
-	server := httptest.NewUnstartedServer(mux)
-	server.EnableHTTP2 = true
-	server.StartTLS()
-	t.Cleanup(server.Close)
+	synctest.Test(t, func(t *testing.T) {
+		checker := NewStaticChecker(userFQN, pingFQN)
+		connectServer := connect.NewServer()
+		Register(connectServer, checker)
+		client := NewClient(connect.NewClient(connectinprocess.New(connectServer)))
 
-	transport := connecthttp.NewTransport(
-		server.Client(),
-		server.URL,
-		connecthttp.WithGRPC(),
-	)
-	client := connect.NewClient(transport)
-	watchSpec := connect.Spec{
-		StreamType: connect.StreamTypeServer,
-		Procedure:  watchProcedure,
-	}
-
-	openStream := func(ctx context.Context, service string) connect.ClientStream {
-		t.Helper()
-		stream, err := client.CallServerStream(
-			ctx,
-			watchSpec,
-			healthv1.HealthCheckRequest_builder{Service: service}.Build(),
-		)
-		if err != nil {
-			t.Fatal(err.Error())
+		receiveStatus := func(t *testing.T, events <-chan WatchEvent, expect Status) {
+			t.Helper()
+			event, ok := <-events
+			if !ok {
+				t.Fatal("channel closed unexpectedly")
+			}
+			if event.Err != nil {
+				t.Fatalf("unexpected error: %v", event.Err)
+			}
+			if event.Response.Status != expect {
+				t.Fatalf("got status %v, expected %v", event.Response.Status, expect)
+			}
 		}
-		return stream
-	}
-	receiveStatus := func(t *testing.T, stream connect.ClientStream, expect Status) {
-		t.Helper()
-		var res healthv1.HealthCheckResponse
-		if err := stream.Receive(&res); err != nil {
-			t.Fatalf("expected message from Watch, got error: %v", err)
+		assertQuiet := func(t *testing.T, streams ...<-chan WatchEvent) {
+			t.Helper()
+			synctest.Wait()
+			for _, events := range streams {
+				select {
+				case event := <-events:
+					t.Fatalf("unexpected event: %+v", event)
+				default:
+				}
+			}
 		}
-		if got := Status(res.GetStatus()); got != expect { //nolint:gosec
-			t.Fatalf("got status %v, expected %v", got, expect)
-		}
-	}
 
-	// Watching an unknown service sends StatusServiceUnknown and keeps the
-	// stream open until the service becomes known.
-	unknownCtx, unknownCancel := context.WithCancel(t.Context())
-	defer unknownCancel()
-	unknownStream := openStream(unknownCtx, "unknown.Service")
-	defer unknownStream.Close()
-	receiveStatus(t, unknownStream, StatusServiceUnknown)
-	checker.SetStatus("unknown.Service", StatusServing)
-	receiveStatus(t, unknownStream, StatusServing)
-	unknownCancel()
+		// synctest.Test fails if a stream outlives the canceled context.
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		user := client.Watch(ctx, &CheckRequest{Service: userFQN})
+		ping := client.Watch(ctx, &CheckRequest{Service: pingFQN})
+		process := client.Watch(ctx, &CheckRequest{})
+		unknown := client.Watch(ctx, &CheckRequest{Service: unknownFQN})
 
-	// Open three streams: two named services and the process-wide
-	// empty string. The empty string has no registered status, but
-	// should still succeed since it represents overall process health.
-	ctx, cancel := context.WithCancel(t.Context())
-	defer cancel()
-	userStream := openStream(ctx, userFQN)
-	defer userStream.Close()
-	pingStream := openStream(ctx, pingFQN)
-	defer pingStream.Close()
-	processStream := openStream(ctx, "")
-	defer processStream.Close()
+		// Each stream receives its current status immediately. The
+		// process-wide stream reports StatusServing without a registered
+		// status, and an unknown service reports StatusServiceUnknown.
+		receiveStatus(t, user, StatusServing)
+		receiveStatus(t, ping, StatusServing)
+		receiveStatus(t, process, StatusServing)
+		receiveStatus(t, unknown, StatusServiceUnknown)
 
-	// All three should receive their current status immediately.
-	receiveStatus(t, userStream, StatusServing)
-	receiveStatus(t, pingStream, StatusServing)
-	receiveStatus(t, processStream, StatusServing)
+		// Changing a service sends nothing to other services' streams.
+		checker.SetStatus(userFQN, StatusNotServing)
+		receiveStatus(t, user, StatusNotServing)
+		assertQuiet(t, ping, process, unknown)
 
-	// Changing one service should only notify that service's stream.
-	// If a spurious message were sent to another stream, it would
-	// cause a later receive on that stream to return the wrong status.
-	checker.SetStatus(userFQN, StatusNotServing)
-	receiveStatus(t, userStream, StatusNotServing)
+		checker.SetStatus("", StatusNotServing)
+		receiveStatus(t, process, StatusNotServing)
+		assertQuiet(t, user, ping, unknown)
 
-	checker.SetStatus(pingFQN, StatusNotServing)
-	receiveStatus(t, pingStream, StatusNotServing)
+		// An unknown service's stream reports its status once it becomes
+		// known.
+		checker.SetStatus(unknownFQN, StatusServing)
+		receiveStatus(t, unknown, StatusServing)
 
-	// The process-wide stream should respond to SetStatus("").
-	checker.SetStatus("", StatusNotServing)
-	receiveStatus(t, processStream, StatusNotServing)
-
-	// De-duplication: setting the same status should not produce a
-	// message. Set the same, then a different status, and verify we
-	// only receive the different one.
-	checker.SetStatus(userFQN, StatusNotServing)
-	checker.SetStatus(userFQN, StatusServing)
-	receiveStatus(t, userStream, StatusServing)
-
-	// Cancel the context and verify the streams end.
-	cancel()
-	for {
-		var res healthv1.HealthCheckResponse
-		if err := userStream.Receive(&res); err != nil {
-			break
-		}
-	}
-	for {
-		var res healthv1.HealthCheckResponse
-		if err := pingStream.Receive(&res); err != nil {
-			break
-		}
-	}
-	for {
-		var res healthv1.HealthCheckResponse
-		if err := processStream.Receive(&res); err != nil {
-			break
-		}
-	}
+		// Setting an unchanged status sends nothing.
+		checker.SetStatus(userFQN, StatusNotServing)
+		assertQuiet(t, user)
+	})
 }
 
 func TestWatchUnimplemented(t *testing.T) {
